@@ -236,6 +236,100 @@ def format_telegram_status(top_spreads):
 
     return msg
 
+
+def telegram_polling_loop():
+    """Background thread for handling Telegram commands in real-time."""
+    global TELEGRAM_CHAT_ID
+    last_update_id = None
+
+    print("Telegram polling started...")
+
+    while True:
+        try:
+            if not TELEGRAM_BOT_TOKEN:
+                time.sleep(5)
+                continue
+
+            # Get updates with long polling
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+            params = {'timeout': 30}
+            if last_update_id:
+                params['offset'] = last_update_id
+
+            response = requests.get(url, params=params, timeout=35)
+            if response.status_code != 200:
+                time.sleep(5)
+                continue
+
+            updates = response.json().get('result', [])
+
+            for update in updates:
+                last_update_id = update['update_id'] + 1
+                message = update.get('message', {})
+                text = message.get('text', '')
+                chat_id = str(message.get('chat', {}).get('id', ''))
+
+                if not chat_id:
+                    continue
+
+                # Update global chat ID
+                TELEGRAM_CHAT_ID = chat_id
+
+                if text == '/start':
+                    welcome = """🚀 <b>TreadFi Trader Bot</b>
+
+Funding Rate Arbitrage Monitor đã kết nối!
+
+<b>Commands:</b>
+/status - Xem top spreads hiện tại
+/signals - Xem active signals
+/help - Hướng dẫn
+
+Bot sẽ tự động gửi alerts khi có tín hiệu entry/exit."""
+                    send_telegram_to(chat_id, welcome)
+
+                elif text == '/status':
+                    if latest_spreads:
+                        status_msg = format_telegram_status(latest_spreads[:5])
+                        send_telegram_to(chat_id, status_msg)
+                    else:
+                        send_telegram_to(chat_id, "⏳ Đang khởi động, vui lòng chờ...")
+
+                elif text == '/signals':
+                    if active_signals:
+                        msg = "📊 <b>Active Signals:</b>\n\n"
+                        for asset, sig in active_signals.items():
+                            msg += f"• <b>{asset}</b>: L:{sig['long_dex']} S:{sig['short_dex']}\n"
+                            msg += f"  Entry: {sig['entry_delta']:.4f}%\n"
+                        send_telegram_to(chat_id, msg)
+                    else:
+                        send_telegram_to(chat_id, "📊 Không có active signals.")
+
+                elif text == '/help':
+                    help_msg = f"""📖 <b>TreadFi Trader Help</b>
+
+<b>Strategy:</b> Delta Neutral Funding Arbitrage
+- Monitor Top {TOP_N_CHECK} spreads
+- Alert khi priority pair ({'/'.join(PRIORITY_DEXS)})
+- LONG DEX có funding thấp nhất
+- SHORT DEX có funding cao nhất
+
+<b>Signals:</b>
+🟢 ENTER - Delta ≥ {DELTA_ENTER_THRESHOLD}%
+⚠️ EXIT - Delta < {DELTA_EXIT_THRESHOLD}%
+🚨 FLIP - DEXs đảo chiều
+📉 DROP - Delta giảm >{DELTA_DROP_ALERT_PERCENT}%
+
+<b>Commands:</b>
+/status - Top spreads
+/signals - Active signals
+/help - Help này"""
+                    send_telegram_to(chat_id, help_msg)
+
+        except Exception as e:
+            print(f"Telegram polling error: {e}")
+            time.sleep(5)
+
 # =============================================================================
 # GLOBAL STATE
 # =============================================================================
@@ -825,6 +919,11 @@ def main():
         health_thread = threading.Thread(target=start_health_server, daemon=True)
         health_thread.start()
 
+    # Start Telegram polling in background
+    if TELEGRAM_BOT_TOKEN:
+        telegram_thread = threading.Thread(target=telegram_polling_loop, daemon=True)
+        telegram_thread.start()
+
     # Handle CLI commands
     if len(sys.argv) > 1:
         cmd = sys.argv[1].lower()
@@ -1038,14 +1137,6 @@ def main():
                     plt.xticks(indices[::step], times[::step])
 
             plt.show()
-
-            # Handle Telegram commands and send status if requested
-            handle_telegram_commands()
-
-            # Send periodic status to Telegram (every 5 minutes)
-            if TELEGRAM_CHAT_ID and int(time.time()) % 300 < UPDATE_INTERVAL:
-                status_msg = format_telegram_status(all_spreads[:5])
-                send_telegram(status_msg)
 
             time.sleep(UPDATE_INTERVAL)
 
