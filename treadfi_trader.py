@@ -63,7 +63,7 @@ def start_health_server():
 # =============================================================================
 
 API_URL = "https://api.hyperliquid.xyz/info"
-UPDATE_INTERVAL = 10  # seconds
+UPDATE_INTERVAL = 60  # seconds (increased for Telegram to avoid spam)
 CONFIG_FILE = "treadfi_config.json"
 
 # Trading Parameters
@@ -72,6 +72,169 @@ DELTA_ENTER_THRESHOLD = 0.008  # Delta >= 0.008% to enter
 DELTA_EXIT_THRESHOLD = 0.003   # Delta < 0.003% to exit
 DELTA_DROP_ALERT_PERCENT = 50  # Alert when delta drops 50% from peak
 TOP_N_CHECK = 2  # Only check top N assets for entry signals
+
+# Telegram Configuration
+TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')  # Will be set when user sends /start
+
+
+# =============================================================================
+# TELEGRAM BOT
+# =============================================================================
+
+def send_telegram(message, parse_mode='HTML'):
+    """Send message to Telegram."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            'chat_id': TELEGRAM_CHAT_ID,
+            'text': message,
+            'parse_mode': parse_mode
+        }
+        response = requests.post(url, json=payload, timeout=10)
+        return response.status_code == 200
+    except Exception as e:
+        print(f"Telegram error: {e}")
+        return False
+
+
+def get_telegram_updates(offset=None):
+    """Get updates from Telegram bot."""
+    if not TELEGRAM_BOT_TOKEN:
+        return []
+
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+        params = {'timeout': 1}
+        if offset:
+            params['offset'] = offset
+        response = requests.get(url, params=params, timeout=10)
+        if response.status_code == 200:
+            return response.json().get('result', [])
+    except Exception:
+        pass
+    return []
+
+
+def handle_telegram_commands():
+    """Handle incoming Telegram commands."""
+    global TELEGRAM_CHAT_ID
+
+    updates = get_telegram_updates()
+    for update in updates:
+        message = update.get('message', {})
+        text = message.get('text', '')
+        chat_id = str(message.get('chat', {}).get('id', ''))
+
+        if text == '/start':
+            # Save chat ID
+            TELEGRAM_CHAT_ID = chat_id
+            os.environ['TELEGRAM_CHAT_ID'] = chat_id
+
+            welcome = """🚀 <b>TreadFi Trader Bot</b>
+
+Funding Rate Arbitrage Monitor đã kết nối!
+
+<b>Commands:</b>
+/status - Xem top spreads hiện tại
+/signals - Xem active signals
+/help - Hướng dẫn
+
+Bot sẽ tự động gửi alerts khi có tín hiệu entry/exit."""
+            send_telegram_to(chat_id, welcome)
+
+        elif text == '/status' and chat_id:
+            TELEGRAM_CHAT_ID = chat_id
+            if latest_spreads:
+                status_msg = format_telegram_status(latest_spreads[:5])
+                send_telegram_to(chat_id, status_msg)
+            else:
+                send_telegram_to(chat_id, "⏳ Đang khởi động, vui lòng chờ...")
+
+        elif text == '/signals' and chat_id:
+            TELEGRAM_CHAT_ID = chat_id
+            if active_signals:
+                msg = "📊 <b>Active Signals:</b>\n\n"
+                for asset, sig in active_signals.items():
+                    msg += f"• <b>{asset}</b>: L:{sig['long_dex']} S:{sig['short_dex']}\n"
+                    msg += f"  Entry: {sig['entry_delta']:.4f}%\n"
+            else:
+                msg = "📊 Không có active signals."
+            send_telegram_to(chat_id, msg)
+
+        elif text == '/help' and chat_id:
+            TELEGRAM_CHAT_ID = chat_id
+            help_msg = f"""📖 <b>TreadFi Trader Help</b>
+
+<b>Strategy:</b> Delta Neutral Funding Arbitrage
+- Monitor Top {TOP_N_CHECK} spreads
+- Alert khi priority pair ({'/'.join(PRIORITY_DEXS)})
+- LONG DEX có funding thấp nhất
+- SHORT DEX có funding cao nhất
+
+<b>Signals:</b>
+🟢 ENTER - Delta ≥ {DELTA_ENTER_THRESHOLD}%
+⚠️ EXIT - Delta < {DELTA_EXIT_THRESHOLD}%
+🚨 FLIP - DEXs đảo chiều
+📉 DROP - Delta giảm >{DELTA_DROP_ALERT_PERCENT}%
+
+<b>Commands:</b>
+/status - Top spreads
+/signals - Active signals
+/help - Help này"""
+            send_telegram_to(chat_id, help_msg)
+
+    # Return last update ID for offset
+    if updates:
+        return updates[-1]['update_id'] + 1
+    return None
+
+
+def send_telegram_to(chat_id, message, parse_mode='HTML'):
+    """Send message to specific chat."""
+    if not TELEGRAM_BOT_TOKEN:
+        return False
+
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            'chat_id': chat_id,
+            'text': message,
+            'parse_mode': parse_mode
+        }
+        response = requests.post(url, json=payload, timeout=10)
+        return response.status_code == 200
+    except Exception:
+        return False
+
+
+def format_telegram_status(top_spreads):
+    """Format top spreads for Telegram message."""
+    timestamp = datetime.now().strftime('%H:%M:%S')
+    msg = f"📊 <b>TreadFi Status</b> [{timestamp}]\n\n"
+
+    for i, s in enumerate(top_spreads, 1):
+        is_pri = s['is_priority']
+        pri_mark = "⭐" if is_pri else ""
+
+        if s['asset'] in active_signals:
+            signal = "✅"
+        elif i <= TOP_N_CHECK and is_pri and s['delta'] >= DELTA_ENTER_THRESHOLD:
+            signal = "🟢"
+        else:
+            signal = ""
+
+        msg += f"#{i} {pri_mark}<b>{s['asset']}</b> {signal}\n"
+        msg += f"   L:{s['long_dex']} → S:{s['short_dex']}\n"
+        msg += f"   Δ: {s['delta']:.4f}% | APR: {s['apr']:.0f}%\n\n"
+
+    if active_signals:
+        msg += f"<b>Active Signals:</b> {len(active_signals)}"
+
+    return msg
 
 # =============================================================================
 # GLOBAL STATE
@@ -82,6 +245,9 @@ active_signals = {}  # {asset: {'entry_delta', 'peak_delta', 'long_dex', 'short_
 
 # Tracked wallets
 tracked_wallets = []
+
+# Latest spreads for Telegram status
+latest_spreads = []
 
 # =============================================================================
 # CONFIG MANAGEMENT
@@ -508,7 +674,7 @@ def analyze_positions(positions, spread_data):
 # =============================================================================
 
 def print_alerts(alerts):
-    """Print alert messages."""
+    """Print alert messages and send to Telegram."""
     if not alerts:
         return
 
@@ -523,6 +689,13 @@ def print_alerts(alerts):
     # Terminal bell for urgent
     if any("🚨" in a or "🟢" in a for a in alerts):
         print("\a")
+
+    # Send to Telegram
+    if TELEGRAM_CHAT_ID:
+        for alert in alerts:
+            # Convert to HTML format for Telegram
+            tg_alert = alert.replace('🟢🟢', '🟢').replace('🚨🚨', '🚨')
+            send_telegram(f"🔔 <b>ALERT</b>\n\n{tg_alert}")
 
 
 def print_positions(analysis):
@@ -755,6 +928,10 @@ def main():
             # Sort by delta descending
             all_spreads.sort(key=lambda x: x['delta'], reverse=True)
 
+            # Store for Telegram status
+            global latest_spreads
+            latest_spreads = all_spreads
+
             # Build spread lookup
             spread_data = {s['asset']: s for s in all_spreads}
 
@@ -862,10 +1039,20 @@ def main():
 
             plt.show()
 
+            # Handle Telegram commands and send status if requested
+            handle_telegram_commands()
+
+            # Send periodic status to Telegram (every 5 minutes)
+            if TELEGRAM_CHAT_ID and int(time.time()) % 300 < UPDATE_INTERVAL:
+                status_msg = format_telegram_status(all_spreads[:5])
+                send_telegram(status_msg)
+
             time.sleep(UPDATE_INTERVAL)
 
     except KeyboardInterrupt:
         print("\n\nStopped.")
+        if TELEGRAM_CHAT_ID:
+            send_telegram("⚠️ TreadFi Trader đã dừng.")
         sys.exit(0)
 
 
