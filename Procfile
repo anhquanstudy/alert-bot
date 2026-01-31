@@ -1,1 +1,1 @@
-worker: python treadfi_trader.py
+web: python treadfi_trader.py
